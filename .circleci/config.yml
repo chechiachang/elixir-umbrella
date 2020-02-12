@@ -330,6 +330,8 @@ jobs:
           name: Wait for DB
           command: dockerize -wait tcp://localhost:3306 -timeout 1m
 
+      - run: mix local.hex --force  # install Hex locally (without prompt)
+      - run: mix local.rebar --force  # fetch a copy of rebar (without prompt)
       - run: mix test  # run all tests in project
 
       - store_test_results:  # upload junit test results for display in Test Summary
@@ -356,7 +358,7 @@ jobs:
           command: |
             if git log --name-only --oneline -1 | grep poetry.lock; then
               source /home/circleci/google-cloud-sdk/path.bash.inc
-              .circleci/create-gce-image.sh
+              echo "Create GCE image"
             fi
   
   container-image:
