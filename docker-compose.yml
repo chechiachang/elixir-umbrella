@@ -1,0 +1,54 @@
+version: "3"
+services:
+  mysql:
+    image: "mysql:5.7"
+    ports:
+    - "3306:3306"
+    environment:
+    - MYSQL_DATABASE=elixir
+    - MYSQL_ALLOW_EMPTY_PASSWORD=yes
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    #volumes:
+    #- ./migrations/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: always
+  elixir:
+    image: "elixir:1.10.1-alpine"
+    ports:
+    - "4040:4040"
+    environment:
+    - PORT=4040
+    volumes:
+      - .:/usr/src/elixir
+    working_dir: /usr/src/elixir
+    #command: elixir mix.exs
+    command:  mix run --no-halt
+  #  redis:
+  #    image: "redis:5.0.1"
+  #    ports:
+  #    - "4307:6379"
+  #    restart: always
+  #celery:
+  #  user: ":"
+  #  build:
+  #    context: .
+  #    dockerfile: Dockerfile
+  #  volumes:
+  #  - .:/usr/src/app
+  #  depends_on:
+  #  - redis
+  #  - mysql
+  # Run Kafka in docker compose
+  # ref: <https://github.com/wurstmeister/kafka-docker/blob/master/docker-compose.yml>
+  #zookeeper:
+  #  image: "wurstmeister/zookeeper:latest"
+  #  ports:
+  #    - "2181:2181"
+  #kafka:
+  #  image: "wurstmeister/kafka:2.11-1.1.1"
+  #  ports:
+  #  - "9092:9092"
+  #  environment:
+  #    KAFKA_ADVERTISED_HOST_NAME: 127.0.0.1
+  #    KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+  #  volumes:
+  #    - /var/run/docker.sock:/var/run/docker.sock
