@@ -16,6 +16,10 @@ defmodule ElixirUmbrella.MixProject do
   #
   # Run "mix help deps" for examples and options.
   defp deps do
-    []
+    [
+      {:maru, "~> 0.13.2"},
+      {:plug_cowboy, "~>2.0"},
+      {:jason, "~>1.1"}
+    ]
   end
 end
