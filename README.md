@@ -1,5 +1,8 @@
 # ElixirUmbrella
 
+[![<ORG_NAME>](https://circleci.com/gh/chechiachang/elixir-umbrella.svg?style=svg)](<LINK>)
+
+
 **TODO: Add description**
 
 ```
