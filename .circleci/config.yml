@@ -3,21 +3,70 @@
 # Check https://circleci.com/docs/2.0/language-elixir/ for more details
 version: 2
 
-parameters:
-  image-tag:
-    type: string
-    default: "circleci/elixir:1.10"
+# ==========
+# Yaml Templates
+# ==========
+
+get-gce-ssh-key: &get-gce-ssh-key
+  name: Get GCE ssh key from ENV
+  command: |
+    mkdir -p /home/circleci/.ssh
+    echo ${GCLOUD_COMPUTE_ENGINE_SSH_KEY} | base64 --decode -i > /home/circleci/.ssh/google_compute_engine
+    echo ${GCLOUD_COMPUTE_ENGINE_SSH_KEY_PUB} | base64 --decode -i > /home/circleci/.ssh/google_compute_engine.pub
+    chmod 400 /home/circleci/.ssh/google_compute_engine
+
+deploy-gce: &deploy-gce
+  docker:
+    - image: circleci/python:3.6.5
+  steps:
+    - restore_cache:
+        keys:
+          - gcloud-sdk-v2-{{ .Branch }}
+    - restore_cache:
+        keys:
+          - gcloud-config-v2-{{ .Branch }}
+    - attach_workspace:
+        at: .
+    - run: *get-gce-ssh-key
+    - run:
+        name: Deploy Endpoint
+        environment:
+          GCP_PROJECT: chechiachang
+          GCE_ZONE: asia-east1-b
+          GCE_IMAGE_PROJECT: chechiachang
+          GCE_IMAGE_FAMILY: chechiachang-ci
+        command: |
+          source /home/circleci/google-cloud-sdk/path.bash.inc
+          echo "Deploy GCE"
+
+deploy-gke: &deploy-gke
+  docker:
+    - image: circleci/python:3.6.5
+  steps:
+    - restore_cache:
+        keys:
+          - gcloud-sdk-v2-{{ .Branch }}
+    - restore_cache:
+        keys:
+          - gcloud-config-v2-{{ .Branch }}
+    - attach_workspace:
+        at: .
+    - run:
+        name: Prepull Image
+        command: |
+          source /home/circleci/google-cloud-sdk/path.bash.inc
+          gcloud container clusters get-credentials ${GKE_CLUSTER_NAME}
+          echo "Deploy prepull"
+    - run:
+        name: Migrate database
+        command: |
+          echo "Deploy GKE"
 
 workflows:
   version: 2
-  install-build-test-deploy:
+  build-test-deploy:
     jobs:
       - checkout:
-          filters:
-            tags:
-              only: /.*/
-
-      - prepare-google-sdk:
           filters:
             tags:
               only: /.*/
@@ -39,7 +88,6 @@ workflows:
       - create-gce-image:
           requires:
             - checkout
-            - prepare-google-sdk
 
       # GCE deployment #
 
@@ -47,7 +95,6 @@ workflows:
           requires:
             - build
             - test
-            - prepare-google-sdk
           filters:
             branches:
               ignore:
@@ -68,7 +115,6 @@ workflows:
           requires:
             - build
             - test
-            - prepare-google-sdk
           filters:
             branches:
               ignore:
@@ -80,7 +126,6 @@ workflows:
 
       #- deploy-sandbox:
       #    requires:
-      #      - prepare-google-sdk
       #      - build
       #      - test
       #    filters:
@@ -91,10 +136,9 @@ workflows:
 
       # GKE deployment #
 
-      - build-image:
+      - container-image:
           requires:
             - checkout
-            - prepare-google-sdk
           filters:
             tags:
               only: /.*/
@@ -108,7 +152,7 @@ workflows:
           requires:
             - build
             - test
-            - build-image
+            - container-image
           type: approval
           filters:
             branches:
@@ -130,7 +174,7 @@ workflows:
           requires:
             - build
             - test
-            - build-image
+            - container-image
           filters:
             tags:
               only: /^[0-9]+\.[0-9]+\.[0-9]+$/
@@ -138,9 +182,7 @@ workflows:
               ignore: /.*/
 
       # Test circleci workflow with devops branch#
-      - circleci-test:
-          requires:
-            - prepare-google-sdk
+      - ci-config-test:
           filters:
             branches:
               only:
@@ -180,29 +222,6 @@ workflows:
   #        requires:
   #          - checkout
 
-  # Sync users' emails to SendGrid contacts list
-  cronjob-sync-sendgrid-contacts:
-    triggers:
-      - schedule:
-          cron: "0 1 * * *" # 9:00(UTC+8) everyday
-          filters:
-            branches:
-              only:
-                - master
-    jobs:
-      - checkout:
-          filters:
-            tags:
-              only: /.*/
-      - prepare-google-sdk:
-          filters:
-            tags:
-              only: /.*/
-      - sync-sendgrid-contacts:
-          requires:
-            - checkout
-            - prepare-google-sdk  # Because we need cloud_sql_proxy
-
 # ==========
 # Jobs
 # ==========
@@ -210,7 +229,7 @@ workflows:
 jobs:
   checkout:
     docker:
-      - image: << pipeline.parameters.image-tag >>
+      - image: "circleci/elixir:1.10"
     steps:
       - attach_workspace:
           at: .
@@ -224,7 +243,7 @@ jobs:
   build:
     docker:
       # specify the version here
-      - image: << pipeline.parameters.image-tag >>
+      - image: "circleci/elixir:1.10"
 
       # Specify service dependencies here if necessary
       # CircleCI maintains a library of pre-built images
@@ -274,7 +293,7 @@ jobs:
   test:
     docker:
       # specify the version here
-      - image: circleci/elixir:1.10
+      - image: "circleci/elixir:1.10"
 
       # Specify service dependencies here if necessary
       # CircleCI maintains a library of pre-built images
@@ -316,3 +335,188 @@ jobs:
       - store_test_results:  # upload junit test results for display in Test Summary
           # Read more: https://circleci.com/docs/2.0/collect-test-data/
           path: _build/test/lib/elixir_umbrella # Replace with the name of your :app
+
+  create-gce-image:
+    docker:
+    - image: "circleci/elixir:1.10"
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - restore_cache:
+          keys:
+            - gcloud-config-v2-{{ .Branch }}
+      - attach_workspace:
+          at: .
+      - restore_cache:
+          key: v2-dependencies-{{ checksum "poetry.lock" }}
+      - run: *get-gce-ssh-key
+      - run:
+          name: Create GCE Image if needed
+          command: |
+            if git log --name-only --oneline -1 | grep poetry.lock; then
+              source /home/circleci/google-cloud-sdk/path.bash.inc
+              .circleci/create-gce-image.sh
+            fi
+  
+  container-image:
+    docker:
+    - image: "circleci/elixir:1.10"
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - restore_cache:
+          keys:
+            - gcloud-config-v2-{{ .Branch }}
+      - attach_workspace:
+          at: .
+      - run:
+          name: Build Image
+          command: |
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+            cd conf && make gcloud_container_builds_submit_chechiachang-server
+  
+  deploy-staging:
+    <<: *deploy-gke
+    environment:
+      SITE: staging
+      CLOUDSQL_NAME: chechiachang:asia-east1:staging-sql
+      CLOUDSQL_PROXY_PORT: tcp:3306
+      GKE_CLUSTER_NAME: staging-server
+  
+  deploy-prod:
+    <<: *deploy-gke
+    environment:
+      SITE: prod
+      CLOUDSQL_NAME: chechiachang:asia-east1:prod-sql
+      CLOUDSQL_PROXY_PORT: tcp:3306
+      GKE_CLUSTER_NAME: prod-server
+  
+  ci-config-test:
+    environment:
+      SITE: staging
+    docker:
+      - image: "circleci/elixir:1.10"
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - restore_cache:
+          keys:
+            - gcloud-config-v2-{{ .Branch }}
+      - run:
+          name: Wait For Pending Pods
+          command: |
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+            for counter in $(seq 1 20); do
+              pending_pod_names=$(kubectl get pod --field-selector=status.phase=Pending -o=go-template="{{range .items}}{{.metadata.name}}{{end}}")
+              if [[ ${pending_pod_names} == "" ]]; then
+                echo "No pending pods" && exit 0
+              fi
+              echo "Wait for Pending pods...${counter}" && sleep 5
+            done
+            echo "Timeout waiting Pending pods." && exit 1
+  
+  stress-test:
+    docker:
+      - image: circleci/node:8.12.0-stretch-browsers
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - restore_cache:
+          keys:
+            - gcloud-config-v2-{{ .Branch }}
+      - attach_workspace:
+          at: .
+      - run:
+          name: Install artillery
+          command: |
+            npm install artillery
+            node_modules/artillery/bin/artillery
+      # TODO cache artillery
+      - run:
+          name: Get Authorization from Staging
+          command: |
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+            node_modules/artillery/bin/artillery run -e staging -o artillery-socketio-$(date +%Y-%m-%dT%H:%M:%S).log conf/stress/socketio.yaml
+            node_modules/artillery/bin/artillery run -e staging -o artillery-http-$(date +%Y-%m-%dT%H:%M:%S).log conf/stress/server.yaml
+  
+  deploy-endpoint:
+    <<: *deploy-gce
+  
+  deploy-dev:
+    <<: *deploy-gce
+    environment:
+      INSTANCE_NAME: dev-chechiachang-server
+      SUBDOMAIN_NAME: api.dev.chechiachang.com # Overwrite default domain (api.CIRCLE_BRANCH.chechiachang.com)
+  
+  deploy-sandbox:
+    <<: *deploy-gce
+    environment:
+      INSTANCE_NAME: sandbox-chechiachang-server
+      SUBDOMAIN_NAME: api.sandbox.chechiachang.com # Overwrite default domain (api.master.chechiachang.com)
+  
+  delete-endpoint:
+    docker:
+      - image: circleci/python:3.6.5
+    environment:
+      GCP_PROJECT: chechiachang
+      GCE_ZONE: asia-east1-b
+      GCE_ADMIN_USER: circleci
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - restore_cache:
+          keys:
+            - gcloud-config-v2-{{ .Branch }}
+      - attach_workspace:
+          at: .
+      - run:
+          name: Delete Endpoint
+          command: |
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+  
+            INSTANCE_NAME="ci-chechiachang-server-${CIRCLE_BRANCH//_/-}"
+            INSTANCE_NAME=${INSTANCE_NAME:0:63}
+  
+            # Retrieve Cloudflare DNS id from GCE metadata and delete the DNS record
+            CLOUDFLARE_DNS_ID=$(gcloud compute instances describe ${INSTANCE_NAME} --format "value[](metadata.items.cloudflare_dns_id)")
+            curl -X DELETE "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${CLOUDFLARE_DNS_ID}" \
+                 -H "X-Auth-Email: ${CLOUDFLARE_EMAIL}" \
+                 -H "X-Auth-Key: ${CLOUDFLARE_API_KEY}" \
+                 -H "Content-Type: application/json"
+  
+            gcloud compute instances delete --quiet ${INSTANCE_NAME}
+  
+  # Clean outdated elasticsearch index to reduce storage usage and JVM memory preassure.
+  clean-elasticsearch:
+    docker:
+      - image: circleci/python:3.6.5
+    steps:
+      - restore_cache:
+          keys:
+            - curator-v2
+      - attach_workspace:
+          at: .
+      - run:
+          name: Clean Elasticsearch
+          command: |
+            python3 -m venv venv
+            . venv/bin/activate
+            pip install elasticsearch-curator
+            curator --config conf/elk/curator/chechiachang/config.yml conf/elk/curator/chechiachang/actions-delete-indices.yml
+  
+            curl -X POST --data-urlencode "payload={
+            \"channel\": \"#devops\",
+            \"username\": \"Clean Elasticsearch Done\",
+            \"text\": \"Build <${CIRCLE_BUILD_URL}|#${CIRCLE_BUILD_NUM}> of ${CIRCLE_PROJECT_REPONAME}@${CIRCLE_BRANCH}\n triggered by ${CIRCLE_USERNAME}\",
+            \"icon_emoji\": \":devops:\"
+            }" ${SLACK_URL}
+            if [[ "$?" != "0" ]]; then echo "slack webhook not return ok" && exit 1; fi
+      - save_cache:
+          key: curator-v2
+          paths:
+            - venv
