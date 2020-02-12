@@ -1,0 +1,732 @@
+# Python CircleCI 2.0 configuration file
+#
+# Check https://circleci.com/docs/2.0/language-python/ for more details
+#
+# Required Environment Varabales in Circle CI: (injected by circleci environment variable)
+# - GCLOUD_SERVICE_KEY=[secure]
+# - GCLOUD_COMPUTE_ENGINE_SSH_KEY=[secure]
+# - GCLOUD_COMPUTE_ENGINE_SSH_KEY_PUB=[secure]
+# - RECAPTCHA_SECRET=[secure]
+# - SENDGRID_API_KEY=[secure]
+# - AUTH_TOKEN_KEY=[secure]
+# - STAGING_MYSQL_USERNAME=[secure]
+# - STAGING_MYSQL_PASSWORD=[secure]
+# - SLACK_URL
+# - ELASTICSEARCH_URL=[secure]
+# - ELASTICSEARCH_HTTP_AUTH=[secure]
+#
+# Deployment Sites
+# - GCE dev: build any branch
+# - GCE sandbox: build master branch, build with staging
+# - GKE staging: build master branch
+# - GKE production: build release by version tag
+
+# =============
+# Job Templates
+# =============
+
+get-gce-ssh-key: &get-gce-ssh-key
+  name: Get GCE ssh key from ENV
+  command: |
+    mkdir -p /home/circleci/.ssh
+    echo ${GCLOUD_COMPUTE_ENGINE_SSH_KEY} | base64 --decode -i > /home/circleci/.ssh/google_compute_engine
+    echo ${GCLOUD_COMPUTE_ENGINE_SSH_KEY_PUB} | base64 --decode -i > /home/circleci/.ssh/google_compute_engine.pub
+    chmod 400 /home/circleci/.ssh/google_compute_engine
+
+deploy-gce: &deploy-gce
+  docker:
+    - image: circleci/python:3.6.5
+  steps:
+    - restore_cache:
+        keys:
+          - gcloud-sdk-v2-{{ .Branch }}
+    - restore_cache:
+        keys:
+          - gcloud-config-v2-{{ .Branch }}
+    - attach_workspace:
+        at: .
+    - run: *get-gce-ssh-key
+    - run:
+        name: Deploy Endpoint
+        environment:
+          GCP_PROJECT: machi-x
+          GCE_ZONE: asia-east1-b
+          GCE_IMAGE_PROJECT: machi-x
+          GCE_IMAGE_FAMILY: machix-server-ci
+          GCE_ADMIN_USER: circleci
+        command: |
+          source /home/circleci/google-cloud-sdk/path.bash.inc
+          ./.circleci/deploy-gce.sh
+
+deploy-gke: &deploy-gke
+  docker:
+    - image: circleci/python:3.6.5
+  steps:
+    - restore_cache:
+        keys:
+          - gcloud-sdk-v2-{{ .Branch }}
+    - restore_cache:
+        keys:
+          - gcloud-config-v2-{{ .Branch }}
+    - attach_workspace:
+        at: .
+    - restore_cache:
+        key: v2-dependencies-{{ checksum "poetry.lock" }}
+    - restore_cache: # Geo mmdb required by flask
+        key: geoip-mmdb-v1-{{ .Branch }}-{{ .Revision }}-{{ .Environment.CIRCLE_TAG }}
+    - run:
+        name: Prepull Image
+        command: |
+          source /home/circleci/google-cloud-sdk/path.bash.inc
+          gcloud container clusters get-credentials ${GKE_CLUSTER_NAME}
+          make -C conf prepull
+    - run:
+        name: Migrate database
+        command: |
+          env
+          export FLASK_APP=manage.py
+          export MACHIX_ENV=development
+          export MYSQL_PORT=3306
+          export REDIS_PORT=6379
+          export MAX_MIND_GEOIP_DATABASE="/tmp/GeoLite2-Country/GeoLite2-Country.mmdb" # For flask run
+          export GOOGLE_APPLICATION_CREDENTIALS="/home/circleci/google-credentials.json" # For flask run
+
+          source /home/circleci/google-cloud-sdk/path.bash.inc
+          # Enable cloud_sql_proxy
+          nohup cloud_sql_proxy -instances=${CLOUDSQL_NAME}=${CLOUDSQL_PROXY_PORT} >cloud_sql_proxy.log 2>cloud_sql_proxy_error.log &
+          # Provide credentials
+          case ${SITE} in
+          "staging")
+            export MYSQL_USERNAME=${STAGING_MYSQL_USERNAME} MYSQL_PASSWORD=${STAGING_MYSQL_PASSWORD}
+            ;;
+          "prod")
+            export MYSQL_USERNAME=${PROD_MYSQL_USERNAME} MYSQL_PASSWORD=${PROD_MYSQL_PASSWORD}
+            ;;
+          esac
+
+          # Use circleci GCS key to upload certificates to machix-i18n
+          echo ${GCLOUD_SERVICE_KEY} | base64 --decode -i > ${GOOGLE_APPLICATION_CREDENTIALS} # Put gcp key in path
+
+          # Preflight Checks: exit 1 if fail
+          make install
+          source ~/.poetry/env
+          if [[ "$(poetry run alembic heads | grep head | wc -l)" != "1" ]]; then
+            echo "===Migration check failed: alembic have more than on head" && exit 1
+          fi
+
+          # [Monitor] Turn off
+          kubectl scale --replicas=0 deployment/engine-probe
+
+          # [Worker] Downscale workers before migration to avoid database table lock during migration and
+          # avoid multiple engines online at the same time during replacing deployment
+          export WORKER_SELECTOR='app=machix,component=worker'
+          echo "===Worker Downtime Start: $(date +%H:%M:%S)"
+          kubectl scale deployment --replicas=0 --selector=${WORKER_SELECTOR} # !worker downtime start
+
+          export ENGINE_SELECTOR='app=machix,component=trading-engine'
+          echo "===Trading Engine Downtime Start: $(date +%H:%M:%S)"
+          kubectl scale deployment --replicas=0 --selector=${ENGINE_SELECTOR} # !trading-engine downtime start
+
+          # [Monitor] Make sure terminating pods are terminated
+          for counter in $(seq 1 20); do
+            terminating_pod_names=$(kubectl get pod --field-selector=status.phase=Terminating -o=go-template="{{range .items}}{{.metadata.name}}{{end}}")
+            if [[ ${terminating_pod_names} == "" ]]; then
+              echo "No terminating pods"
+              break
+            fi
+            echo "Wait for Terminating pods...${counter}" && sleep 3
+          done
+
+          poetry run alembic upgrade head # !Database table lock
+
+          # Replacing Image Tag on GKE Cluster
+          cd conf/
+          make update # !Rolling update servers / workers
+          cd ..
+
+          # Upscale engine after migration
+          kubectl scale --replicas=1 deployment --selector=${ENGINE_SELECTOR}  # !trading-engine downtime end
+          kubectl scale --replicas=1 deployment --selector=${WORKER_SELECTOR}  # !worker downtime end
+    - run:
+        name: Wait For Pending Pods
+        command: |
+          source /home/circleci/google-cloud-sdk/path.bash.inc
+          kubectl get deploy -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[0].image}{"\n"}{end}'
+          for counter in $(seq 1 60); do
+            pending_pod_names=$(kubectl get pod --field-selector=status.phase=Pending -o=go-template="{{range .items}}{{.metadata.name}}{{end}}")
+            if [[ ${pending_pod_names} == "" ]]; then
+              echo "No pending pods" && echo "===Trading Engine / Worker Downtime End: $(date +%H:%M:%S)"
+
+              # [Monitor] Turn on
+              kubectl scale --replicas=1 deployment/engine-probe
+              exit 0
+            fi
+            echo "Wait for Pending pods...${counter}" && sleep 10
+          done
+          echo "Timeout waiting for Pending pods." && exit 1
+
+    - run:
+        name: Send Slack
+        command: |
+          curl -X POST --data-urlencode "payload={
+          \"channel\": \"#ci-machix-server\",
+          \"username\": \"[CircleCI] Deployed to Site ${SITE}\",
+          \"text\": \"Build <${CIRCLE_BUILD_URL}|#${CIRCLE_BUILD_NUM}> of ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}@${CIRCLE_BRANCH:-${CIRCLE_TAG}}\n triggered by ${CIRCLE_USERNAME}\"
+          }" ${SLACK_URL}
+
+# =========
+# Workflows
+# =========
+
+workflows:
+  version: 2
+  install-test-deploy:
+    jobs:
+      - checkout:
+          filters:
+            tags:
+              only: /.*/
+
+      - prepare-google-sdk:
+          filters:
+            tags:
+              only: /.*/
+
+      - install-test:
+          requires:
+            - checkout
+          filters:
+            tags:
+              only: /.*/
+            branches:
+              ignore:
+                - devops
+
+      - create-gce-image:
+          requires:
+            - checkout
+            - prepare-google-sdk
+
+      # GCE deployment #
+
+      - ?deploy-endpoint:
+          requires:
+            - install-test
+            - prepare-google-sdk
+          filters:
+            branches:
+              ignore:
+                - master
+          type: approval
+      - deploy-endpoint:
+          requires:
+            - ?deploy-endpoint
+      - ?delete-endpoint:
+          requires:
+            - deploy-endpoint
+          type: approval
+      - delete-endpoint:
+          requires:
+            - ?delete-endpoint
+
+      - ?deploy-dev:
+          requires:
+            - install-test
+            - prepare-google-sdk
+          filters:
+            branches:
+              ignore:
+                - master
+          type: approval
+      - deploy-dev:
+          requires:
+            - ?deploy-dev
+
+      #- deploy-sandbox:
+      #    requires:
+      #      - prepare-google-sdk
+      #      - install-test
+      #    filters:
+      #      branches:
+      #        only:
+      #          - master
+      #          - sandbox
+
+      # GKE deployment #
+
+      - build-image:
+          requires:
+            - checkout
+            - prepare-google-sdk
+          filters:
+            tags:
+              only: /.*/
+            branches:
+              only:
+                - master
+                - dev
+
+      # Enforce manually approval to avoid interupting QA testing
+      - ?deploy-staging:
+          requires:
+            - install-test
+            - build-image
+          type: approval
+          filters:
+            branches:
+              only:
+                - master
+                - dev
+      - deploy-staging:
+          requires:
+            - ?deploy-staging
+      - ?stress-test:
+          type: approval
+          requires:
+            - deploy-staging
+      - stress-test:
+          requires:
+            - ?stress-test
+
+      - deploy-prod:
+          requires:
+            - install-test
+            - build-image
+          filters:
+            tags:
+              only: /^[0-9]+\.[0-9]+\.[0-9]+$/
+            branches:
+              ignore: /.*/
+
+      # Test circleci workflow with devops branch#
+      - circleci-test:
+          requires:
+            - prepare-google-sdk
+          filters:
+            branches:
+              only:
+                - devops
+
+      # DISABLED
+      # Test clean-elasticsearch job with master
+      #- ?clean-elasticsearch:
+      #    type: approval
+      #    requires:
+      #      - checkout
+      #    filters:
+      #      branches:
+      #        only:
+      #          - master
+      #          - devops
+      #- clean-elasticsearch:
+      #    requires:
+      #      - ?clean-elasticsearch
+
+  # DISABLED
+  # Clean outdated elasticsearch index to reduce storage usage and JVM memory preassure.
+  #cronjob-clean-elasticsearch:
+  #  triggers:
+  #    - schedule:
+  #        #cron: "30 1 * * 1-5" # 9:30+8:00 every Mon-Fri
+  #        cron: "30 1 * * *" # 9:30+8:00 everyday
+  #        filters:
+  #          branches:
+  #            only:
+  #              - master
+  #  jobs:
+  #    - checkout:
+  #        filters:
+  #          tags:
+  #            only: /.*/
+  #    - clean-elasticsearch:
+  #        requires:
+  #          - checkout
+
+  # Sync users' emails to SendGrid contacts list
+  cronjob-sync-sendgrid-contacts:
+    triggers:
+      - schedule:
+          cron: "0 1 * * *" # 9:00(UTC+8) everyday
+          filters:
+            branches:
+              only:
+                - master
+    jobs:
+      - checkout:
+          filters:
+            tags:
+              only: /.*/
+      - prepare-google-sdk:
+          filters:
+            tags:
+              only: /.*/
+      - sync-sendgrid-contacts:
+          requires:
+            - checkout
+            - prepare-google-sdk  # Because we need cloud_sql_proxy
+
+# ========
+# Job List
+# ========
+
+version: 2
+jobs:
+  prepare-google-sdk:
+    docker:
+      - image: circleci/python:3.6.5
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+            - gcloud-sdk-v2-
+      - run:
+          name: Prepare Google Cloud SDK
+          command: |
+            if [ ! -d "/home/circleci/google-cloud-sdk/bin" ]; then
+              sudo apt-get update
+              sudo apt-get install coreutils
+               rm -rf /home/circleci/google-cloud-sdk
+               export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+               curl https://sdk.cloud.google.com | bash > /dev/null
+            fi
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+            gcloud --quiet components update
+            gcloud --quiet components install kubectl cloud_sql_proxy
+      - save_cache:
+          key: gcloud-sdk-v2-{{ .Branch }}
+          paths:
+            - "/home/circleci/google-cloud-sdk"
+      - run:
+          name: Configure Gcloud SDK
+          environment:
+            GCP_PROJECT: machi-x
+            GCE_REGION: asia-east1
+            GCE_ZONE: asia-east1-b
+            GKE_CLUSTER_NAME: staging-machix-server
+          command: |
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+            echo ${GCLOUD_SERVICE_KEY} | base64 --decode -i > /home/circleci/gcloud-service-key.json
+            gcloud auth activate-service-account --key-file /home/circleci/gcloud-service-key.json
+            gcloud config set project ${GCP_PROJECT}
+            gcloud config set compute/region ${GCE_REGION}
+            gcloud config set compute/zone ${GCE_ZONE}
+            gcloud config set container/cluster ${GKE_CLUSTER_NAME}
+      - save_cache:
+          key: gcloud-config-v2-{{ .Branch }}
+          paths:
+            - "/home/circleci/.config/gcloud"
+
+  checkout:
+    docker:
+      - image: circleci/python:3.6.5
+    steps:
+      - attach_workspace:
+          at: .
+      - checkout
+      - run:
+          name: Pull Submodule
+          command: git submodule update --init
+      - persist_to_workspace:
+          root: .
+          paths: .
+
+  install-test:
+    docker:
+      - image: circleci/python:3.6.5
+      - image: mysql:5.7.26
+        environment:
+          MYSQL_USER: root
+          MYSQL_DATABASE: machix
+          MYSQL_ALLOW_EMPTY_PASSWORD: true
+        command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+      - image: redis:5.0.0
+      - image: wurstmeister/zookeeper
+        ports:
+          - "2181:2181"
+      - image: "wurstmeister/kafka:2.11-1.1.1"
+        ports:
+        - "9092:9092"
+        environment:
+          KAFKA_ADVERTISED_HOST_NAME: 127.0.0.1
+          KAFKA_ZOOKEEPER_CONNECT: 127.0.0.1:2181
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_cache:
+          key: v2-dependencies-{{ checksum "poetry.lock" }}
+      - run:
+          name: Make Install
+          environment:
+            PIPENV: .venv
+            PYTHON_VERSION: 3.6.5
+          command: |
+            pip install --upgrade --user pip
+            make install
+            #make ${HOME}/.poetry/bin/poetry
+            source ~/.poetry/env
+            #poetry config settings.virtualenvs.create false
+            poetry install
+      - save_cache:
+          paths:
+            - /home/circleci/.cache/pypoetry/virtualenvs
+          key: v2-dependencies-{{ checksum "poetry.lock" }}
+      - persist_to_workspace:
+          root: .
+          paths: .
+      # === Geoip mmdb
+      - restore_cache: # Geo mmdb required by flask
+          key: geoip-mmdb-v1-{{ .Branch }}-{{ .Revision }}-{{ .Environment.CIRCLE_TAG }}
+      - run:
+          name: Download GeoLite Country MMDB
+          environment:
+            GEO_NAME: GeoLite2-Country.mmdb
+            GEO_TAR_FILE: GeoLite2-Country.tar.gz
+          command: |
+            wget -O ${GEO_TAR_FILE} http://geolite.maxmind.com/download/geoip/database/GeoLite2-Country.tar.gz
+            file_in_tar=$(tar -tf ${GEO_TAR_FILE} | grep ${GEO_NAME})
+            tar -zxf ${GEO_TAR_FILE} ${file_in_tar}
+            mkdir -p /tmp/GeoLite2-Country
+            mv ${file_in_tar} /tmp/GeoLite2-Country
+      - save_cache:
+          paths:
+            - "/tmp/GeoLite2-Country"
+          key: geoip-mmdb-v1-{{ .Branch }}-{{ .Revision }}-{{ .Environment.CIRCLE_TAG }}
+      # === Geoip mmdb End
+      - run:
+          name: Alembic Upgrade and Test
+          environment:
+            MYSQL_PORT: 3306
+            REDIS_PORT: 6379
+            FLASK_APP: manage.py
+            MACHIX_ENV: development
+            MAX_MIND_GEOIP_DATABASE: "/tmp/GeoLite2-Country/GeoLite2-Country.mmdb"
+            GOOGLE_APPLICATION_CREDENTIALS: /home/circleci/google-credentials.json
+          command: |
+            # Use circleci GCS key to upload certificates to machix-i18n
+            echo ${GCLOUD_SERVICE_KEY} | base64 --decode -i > ${GOOGLE_APPLICATION_CREDENTIALS}
+            source ~/.poetry/env
+            poetry run alembic upgrade head
+            poetry run flask load-fixtures
+            poetry run flask test
+
+  create-gce-image:
+    docker:
+      - image: circleci/python:3.6.5
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - restore_cache:
+          keys:
+            - gcloud-config-v2-{{ .Branch }}
+      - attach_workspace:
+          at: .
+      - restore_cache:
+          key: v2-dependencies-{{ checksum "poetry.lock" }}
+      - run: *get-gce-ssh-key
+      - run:
+          name: Create GCE Image if needed
+          command: |
+            if git log --name-only --oneline -1 | grep poetry.lock; then
+              source /home/circleci/google-cloud-sdk/path.bash.inc
+              .circleci/create-gce-image.sh
+            fi
+
+  build-image:
+    docker:
+      - image: circleci/python:3.6.5
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - restore_cache:
+          keys:
+            - gcloud-config-v2-{{ .Branch }}
+      - attach_workspace:
+          at: .
+      - run:
+          name: Build Image
+          command: |
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+            cd conf && make gcloud_container_builds_submit_machix-server
+
+  deploy-staging:
+    <<: *deploy-gke
+    environment:
+      SITE: staging
+      CLOUDSQL_NAME: machi-x:asia-east1:staging-machix-server
+      CLOUDSQL_PROXY_PORT: tcp:3306
+      GKE_CLUSTER_NAME: staging-machix-server
+
+  deploy-prod:
+    <<: *deploy-gke
+    environment:
+      SITE: prod
+      CLOUDSQL_NAME: machi-x:asia-east1:prod-machix-server
+      CLOUDSQL_PROXY_PORT: tcp:3306
+      GKE_CLUSTER_NAME: machix-server
+
+  circleci-test:
+    environment:
+      SITE: staging
+    docker:
+      - image: circleci/python:3.6.5
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - restore_cache:
+          keys:
+            - gcloud-config-v2-{{ .Branch }}
+      - run:
+          name: Wait For Pending Pods
+          command: |
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+            for counter in $(seq 1 20); do
+              pending_pod_names=$(kubectl get pod --field-selector=status.phase=Pending -o=go-template="{{range .items}}{{.metadata.name}}{{end}}")
+              if [[ ${pending_pod_names} == "" ]]; then
+                echo "No pending pods" && exit 0
+              fi
+              echo "Wait for Pending pods...${counter}" && sleep 5
+            done
+            echo "Timeout waiting Pending pods." && exit 1
+
+  stress-test:
+    docker:
+      - image: circleci/node:8.12.0-stretch-browsers
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - restore_cache:
+          keys:
+            - gcloud-config-v2-{{ .Branch }}
+      - attach_workspace:
+          at: .
+      - run:
+          name: Install artillery
+          command: |
+            npm install artillery
+            node_modules/artillery/bin/artillery
+      # TODO cache artillery
+      - run:
+          name: Get Authorization from Staging
+          command: |
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+            TEST_SERVER_POD_NAME=$(kubectl get po --selector='app=machix,component=test-server' -o jsonpath='{.items[0].metadata.name}')
+            export Authorization=$(kubectl exec ${TEST_SERVER_POD_NAME} python scripts/make_auth_token.py)
+            node_modules/artillery/bin/artillery run -e staging -o artillery-socketio-$(date +%Y-%m-%dT%H:%M:%S).log conf/stress/socketio.yaml
+            node_modules/artillery/bin/artillery run -e staging -o artillery-http-$(date +%Y-%m-%dT%H:%M:%S).log conf/stress/server.yaml
+
+  deploy-endpoint:
+    <<: *deploy-gce
+
+  deploy-dev:
+    <<: *deploy-gce
+    environment:
+      INSTANCE_NAME: dev-machix-server
+      SUBDOMAIN_NAME: api.dev.machix.com # Overwrite default domain (api.CIRCLE_BRANCH.machix.com)
+
+  deploy-sandbox:
+    <<: *deploy-gce
+    environment:
+      INSTANCE_NAME: sandbox-machix-server
+      SUBDOMAIN_NAME: api.sandbox.machix.com # Overwrite default domain (api.master.machix.com)
+
+  delete-endpoint:
+    docker:
+      - image: circleci/python:3.6.5
+    environment:
+      GCP_PROJECT: machi-x
+      GCE_ZONE: asia-east1-b
+      GCE_ADMIN_USER: circleci
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - restore_cache:
+          keys:
+            - gcloud-config-v2-{{ .Branch }}
+      - attach_workspace:
+          at: .
+      - run:
+          name: Delete Endpoint
+          command: |
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+
+            INSTANCE_NAME="ci-machix-server-${CIRCLE_BRANCH//_/-}"
+            INSTANCE_NAME=${INSTANCE_NAME:0:63}
+
+            # Retrieve Cloudflare DNS id from GCE metadata and delete the DNS record
+            CLOUDFLARE_DNS_ID=$(gcloud compute instances describe ${INSTANCE_NAME} --format "value[](metadata.items.cloudflare_dns_id)")
+            curl -X DELETE "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${CLOUDFLARE_DNS_ID}" \
+                 -H "X-Auth-Email: ${CLOUDFLARE_EMAIL}" \
+                 -H "X-Auth-Key: ${CLOUDFLARE_API_KEY}" \
+                 -H "Content-Type: application/json"
+
+            gcloud compute instances delete --quiet ${INSTANCE_NAME}
+
+  # Clean outdated elasticsearch index to reduce storage usage and JVM memory preassure.
+  clean-elasticsearch:
+    docker:
+      - image: circleci/python:3.6.5
+    steps:
+      - restore_cache:
+          keys:
+            - curator-v2
+      - attach_workspace:
+          at: .
+      - run:
+          name: Clean Elasticsearch
+          command: |
+            python3 -m venv venv
+            . venv/bin/activate
+            pip install elasticsearch-curator
+            curator --config conf/elk/curator/machix/config.yml conf/elk/curator/machix/actions-delete-indices.yml
+
+            curl -X POST --data-urlencode "payload={
+            \"channel\": \"#devops\",
+            \"username\": \"Clean Elasticsearch Done\",
+            \"text\": \"Build <${CIRCLE_BUILD_URL}|#${CIRCLE_BUILD_NUM}> of ${CIRCLE_PROJECT_REPONAME}@${CIRCLE_BRANCH}\n triggered by ${CIRCLE_USERNAME}\",
+            \"icon_emoji\": \":devops:\"
+            }" ${SLACK_URL}
+            if [[ "$?" != "0" ]]; then echo "slack webhook not return ok" && exit 1; fi
+      - save_cache:
+          key: curator-v2
+          paths:
+            - venv
+
+  # Sync users' emails to SendGrid Contacts list
+  sync-sendgrid-contacts:
+    docker:
+      - image: circleci/python:3.6.5
+    steps:
+      - restore_cache:
+          keys:
+            - gcloud-sdk-v2-{{ .Branch }}
+      - attach_workspace:
+          at: .
+      - run:
+          name: Sync SendGrid Contacts
+          environment:
+            CLOUDSQL_NAME: machi-x:asia-east1:prod-machix-server-replica  # Query the Read-Only replica
+            CLOUDSQL_PROXY_PORT: tcp:3306
+            PROD_MYSQL_HOST: 127.0.0.1  # Because we use cloud_sql_proxy
+            PROD_MYSQL_DATABASE: machix
+            # PROD_MYSQL_USERNAME, PROD_MYSQL_PASSWORD, SENDGRID_API_KEY have been set in CircleCI configs
+          command: |
+            # Enable cloud_sql_proxy
+            source /home/circleci/google-cloud-sdk/path.bash.inc
+            echo ${GCLOUD_SERVICE_KEY} | base64 --decode -i > /home/circleci/gcloud-service-key.json
+            gcloud auth activate-service-account --key-file /home/circleci/gcloud-service-key.json
+            nohup cloud_sql_proxy -instances=${CLOUDSQL_NAME}=${CLOUDSQL_PROXY_PORT} >cloud_sql_proxy.log 2>cloud_sql_proxy_error.log &
+            # Upgrade pip
+            pip install --upgrade --user pip
+            # Install dependencies
+            python3 -m venv venv
+            . venv/bin/activate
+            pip install pymysql requests
+            # Execute the sync script
+            python scripts/sync_sendgrid_contacts.py

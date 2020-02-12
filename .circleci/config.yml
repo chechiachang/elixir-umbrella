@@ -2,8 +2,276 @@
 #
 # Check https://circleci.com/docs/2.0/language-elixir/ for more details
 version: 2
+
+parameters:
+  image-tag:
+    type: string
+    default: "circleci/elixir:1.10"
+
+workflows:
+  version: 2
+  install-build-test-deploy:
+    jobs:
+      - checkout:
+          filters:
+            tags:
+              only: /.*/
+
+      - prepare-google-sdk:
+          filters:
+            tags:
+              only: /.*/
+
+      - build:
+          requires:
+            - checkout
+          filters:
+            tags:
+              only: /.*/
+
+      - test:
+          requires:
+            - build
+          filters:
+            tags:
+              only: /.*/
+
+      - create-gce-image:
+          requires:
+            - checkout
+            - prepare-google-sdk
+
+      # GCE deployment #
+
+      - ?deploy-endpoint:
+          requires:
+            - build
+            - test
+            - prepare-google-sdk
+          filters:
+            branches:
+              ignore:
+                - master
+          type: approval
+      - deploy-endpoint:
+          requires:
+            - ?deploy-endpoint
+      - ?delete-endpoint:
+          requires:
+            - deploy-endpoint
+          type: approval
+      - delete-endpoint:
+          requires:
+            - ?delete-endpoint
+
+      - ?deploy-dev:
+          requires:
+            - build
+            - test
+            - prepare-google-sdk
+          filters:
+            branches:
+              ignore:
+                - master
+          type: approval
+      - deploy-dev:
+          requires:
+            - ?deploy-dev
+
+      #- deploy-sandbox:
+      #    requires:
+      #      - prepare-google-sdk
+      #      - build
+      #      - test
+      #    filters:
+      #      branches:
+      #        only:
+      #          - master
+      #          - sandbox
+
+      # GKE deployment #
+
+      - build-image:
+          requires:
+            - checkout
+            - prepare-google-sdk
+          filters:
+            tags:
+              only: /.*/
+            branches:
+              only:
+                - master
+                - dev
+
+      # Enforce manually approval to avoid interupting QA testing
+      - ?deploy-staging:
+          requires:
+            - build
+            - test
+            - build-image
+          type: approval
+          filters:
+            branches:
+              only:
+                - master
+                - dev
+      - deploy-staging:
+          requires:
+            - ?deploy-staging
+      - ?stress-test:
+          type: approval
+          requires:
+            - deploy-staging
+      - stress-test:
+          requires:
+            - ?stress-test
+
+      - deploy-prod:
+          requires:
+            - build
+            - test
+            - build-image
+          filters:
+            tags:
+              only: /^[0-9]+\.[0-9]+\.[0-9]+$/
+            branches:
+              ignore: /.*/
+
+      # Test circleci workflow with devops branch#
+      - circleci-test:
+          requires:
+            - prepare-google-sdk
+          filters:
+            branches:
+              only:
+                - devops
+
+  # DISABLED
+  # Test clean-elasticsearch job with master
+  #- ?clean-elasticsearch:
+  #    type: approval
+  #    requires:
+  #      - checkout
+  #    filters:
+  #      branches:
+  #        only:
+  #          - master
+  #          - devops
+  #- clean-elasticsearch:
+  #    requires:
+  #      - ?clean-elasticsearch
+  #
+  # Clean outdated elasticsearch index to reduce storage usage and JVM memory preassure.
+  #cronjob-clean-elasticsearch:
+  #  triggers:
+  #    - schedule:
+  #        #cron: "30 1 * * 1-5" # 9:30+8:00 every Mon-Fri
+  #        cron: "30 1 * * *" # 9:30+8:00 everyday
+  #        filters:
+  #          branches:
+  #            only:
+  #              - master
+  #  jobs:
+  #    - checkout:
+  #        filters:
+  #          tags:
+  #            only: /.*/
+  #    - clean-elasticsearch:
+  #        requires:
+  #          - checkout
+
+  # Sync users' emails to SendGrid contacts list
+  cronjob-sync-sendgrid-contacts:
+    triggers:
+      - schedule:
+          cron: "0 1 * * *" # 9:00(UTC+8) everyday
+          filters:
+            branches:
+              only:
+                - master
+    jobs:
+      - checkout:
+          filters:
+            tags:
+              only: /.*/
+      - prepare-google-sdk:
+          filters:
+            tags:
+              only: /.*/
+      - sync-sendgrid-contacts:
+          requires:
+            - checkout
+            - prepare-google-sdk  # Because we need cloud_sql_proxy
+
+# ==========
+# Jobs
+# ==========
+
 jobs:
+  checkout:
+    docker:
+      - image: << pipeline.parameters.image-tag >>
+    steps:
+      - attach_workspace:
+          at: .
+      - checkout
+      - run:
+          name: Pull Submodule
+          command: git submodule update --init
+      - persist_to_workspace:
+          root: .
+          paths: .
   build:
+    docker:
+      # specify the version here
+      - image: << pipeline.parameters.image-tag >>
+
+      # Specify service dependencies here if necessary
+      # CircleCI maintains a library of pre-built images
+      # documented at https://circleci.com/docs/2.0/circleci-images/
+      # - image: circleci/postgres:9.4
+
+    steps:
+      - attach_workspace:
+          at: .
+
+      - run: mix local.hex --force  # install Hex locally (without prompt)
+      - run: mix local.rebar --force  # fetch a copy of rebar (without prompt)
+
+      - restore_cache:  # restores saved mix cache
+      # Read about caching dependencies: https://circleci.com/docs/2.0/caching/
+          keys:  # list of cache keys, in decreasing specificity
+            - v1-mix-cache-{{ .Branch }}-{{ checksum "mix.lock" }}
+            - v1-mix-cache-{{ .Branch }}
+            - v1-mix-cache
+      - restore_cache:  # restores saved build cache
+          keys:
+            - v1-build-cache-{{ .Branch }}
+            - v1-build-cache
+
+      - run: mix do deps.get, compile  # get updated dependencies & compile them
+
+      - save_cache:  # generate and store mix cache
+          key: v1-mix-cache-{{ .Branch }}-{{ checksum "mix.lock" }}
+          paths: "deps"
+      - save_cache:  # make another, less specific cache
+          key: v1-mix-cache-{{ .Branch }}
+          paths: "deps"
+      - save_cache:  # you should really save one more cache (just in case)
+          key: v1-mix-cache
+          paths: "deps"
+      - save_cache: # don't forget to save a *build* cache, too
+          key: v1-build-cache-{{ .Branch }}
+          paths: "_build"
+      - save_cache: # and one more build cache for good measure
+          key: v1-build-cache
+          paths: "_build"
+
+      - persist_to_workspace:
+          root: .
+          paths: .
+    
+  test:
     docker:
       # specify the version here
       - image: circleci/elixir:1.10
@@ -35,39 +303,9 @@ jobs:
         volumes:
           - /var/run/docker.sock:/var/run/docker.sock
 
-    working_directory: ~/repo
     steps:
-      - checkout
-
-      - run: mix local.hex --force  # install Hex locally (without prompt)
-      - run: mix local.rebar --force  # fetch a copy of rebar (without prompt)
-
-      - restore_cache:  # restores saved mix cache
-      # Read about caching dependencies: https://circleci.com/docs/2.0/caching/
-          keys:  # list of cache keys, in decreasing specificity
-            - v1-mix-cache-{{ .Branch }}-{{ checksum "mix.lock" }}
-            - v1-mix-cache-{{ .Branch }}
-            - v1-mix-cache
-      - restore_cache:  # restores saved build cache
-          keys:
-            - v1-build-cache-{{ .Branch }}
-            - v1-build-cache
-      - run: mix do deps.get, compile  # get updated dependencies & compile them
-      - save_cache:  # generate and store mix cache
-          key: v1-mix-cache-{{ .Branch }}-{{ checksum "mix.lock" }}
-          paths: "deps"
-      - save_cache:  # make another, less specific cache
-          key: v1-mix-cache-{{ .Branch }}
-          paths: "deps"
-      - save_cache:  # you should really save one more cache (just in case)
-          key: v1-mix-cache
-          paths: "deps"
-      - save_cache: # don't forget to save a *build* cache, too
-          key: v1-build-cache-{{ .Branch }}
-          paths: "_build"
-      - save_cache: # and one more build cache for good measure
-          key: v1-build-cache
-          paths: "_build"
+      - attach_workspace:
+          at: .
 
       - run:  # special utility that stalls main process until DB is ready
           name: Wait for DB
